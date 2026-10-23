@@ -17,14 +17,15 @@ Key system attributes:
 * **Double-Entry Bookkeeping:** Every monetary movement generates two balanced, immutable ledger entries.
 * **API-Level Idempotency:** Exactly-once semantics enforced via durable database constraints and request hashing.
 * **Deadlock-Free Concurrency Control:** Row-level pessimistic locking (`SELECT ... FOR UPDATE`) with deterministic resource ordering.
+* **Preserved Failure Auditing:** Differentiating system exceptions from business failures to ensure terminal `FAILED` states are durable and retries receive deterministic responses.
 * **ACID Transaction Boundaries:** Strict atomic updates combining wallet balances, ledger entries, transfer records, and idempotency entries.
 * **Clean Layered Architecture:** Strict decoupling between Transport (Handlers), Domain Logic (Service), and Data Persistence (Repository).
 
 ---
 
-## 2. API Contract
+## 2. API Contract & Validation Rules
 
-### Create Transfer Endpoint
+### 2.1 Create Transfer Endpoint
 * **Path:** `POST /transfers`
 * **Headers:** `Content-Type: application/json`
 
@@ -38,10 +39,12 @@ Key system attributes:
 }
 ```
 
-*Notes on Payload Validation:*
-* `amount`: Stored as an integer in the smallest currency unit (e.g., cents, paise, or satoshis) to eliminate IEEE-754 floating-point inaccuracies. Must be strictly positive ($> 0$).
-* `fromWalletId != toWalletId`: Self-transfers are rejected at the handler validation layer.
-* `idempotencyKey`: Non-empty string (UUID v4 or client token, max 255 chars).
+#### Early Validation Layer (Pre-Locking / Pre-Transaction)
+Before opening database transactions or acquiring locks, the request is validated:
+* `amount > 0`: Stored as an integer in the smallest currency unit (e.g., cents/paise) to eliminate IEEE-754 floating-point inaccuracies. Zero or negative amounts return `400 Bad Request`.
+* `fromWalletId != toWalletId`: Self-transfers are rejected immediately with `400 Bad Request`.
+* `idempotencyKey`, `fromWalletId`, `toWalletId`: Must be non-empty, sanitized strings.
+* Maximum payload size bounds enforced to reject malformed/oversized JSON.
 
 #### Response Payload (HTTP 201 Created / 200 OK for replays)
 ```json
@@ -57,10 +60,12 @@ Key system attributes:
 ```
 
 #### Error Responses
-* `400 Bad Request`: Validation failure (negative amount, identical source & destination, missing fields).
+* `400 Bad Request`: Validation failure (negative/zero amount, self-transfer, malformed fields).
 * `404 Not Found`: Source or destination wallet does not exist.
-* `409 Conflict / 422 Unprocessable Entity`: Insufficient funds, or idempotency key reused with a conflicting payload.
-* `500 Internal Server Error`: Unhandled database error or unexpected system failure.
+* `409 Conflict`: 
+  1. Idempotency key reused with a conflicting payload (different amount or destination).
+  2. Insufficient funds (or `422 Unprocessable Entity` depending on API preference).
+* `500 Internal Server Error`: Unhandled database error or unexpected infrastructure failure.
 
 ---
 
@@ -72,7 +77,7 @@ Key system attributes:
 erDiagram
     WALLETS ||--o{ LEDGER_ENTRIES : "records"
     WALLETS ||--o{ TRANSFERS : "source / dest"
-    TRANSFERS ||--|{ LEDGER_ENTRIES : "generates exactly 2"
+    TRANSFERS ||--|{ LEDGER_ENTRIES : "generates exactly 2 if PROCESSED"
     TRANSFERS ||--o| IDEMPOTENCY_RECORDS : "tracks"
 
     WALLETS {
@@ -107,14 +112,16 @@ erDiagram
     IDEMPOTENCY_RECORDS {
         string key PK
         string request_hash
+        string status "PENDING, COMPLETED"
         int response_status
         text response_body
         string transfer_id FK
         timestamp created_at
+        timestamp updated_at
     }
 ```
 
-### 3.2 Table Definitions & Constraints
+### 3.2 Table Definitions & Defense-in-Depth Constraints
 
 ```sql
 -- 1. Wallets
@@ -160,16 +167,18 @@ CREATE INDEX idx_ledger_transfer ON ledger_entries(transfer_id);
 CREATE TABLE idempotency_records (
     key VARCHAR(255) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMPLETED')),
     response_status INT NOT NULL,
     response_body TEXT NOT NULL,
     transfer_id VARCHAR(64) NULL REFERENCES transfers(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
 ---
 
-## 4. Concurrency & Locking Strategy
+## 4. Concurrency & Deadlock Prevention Strategy
 
 ### 4.1 The Race Condition Threat
 If two requests debit the same wallet ($W_1$) concurrently:
@@ -222,9 +231,20 @@ For every transfer of amount $X$ from $W_{from}$ to $W_{to}$:
 
 ---
 
-## 6. Idempotency Strategy
+## 6. Idempotency & Failure Persistence Strategy
 
-### 6.1 Workflow
+### 6.1 Differentiating System Errors vs Business Failures (Crucial SDE-3 Distinction)
+* **System Errors (DB connection timeout, deadlock kill):**
+  $\rightarrow$ The database transaction **rolls back** cleanly. The client receives `500 Internal Server Error` (or `503 Service Unavailable`) and can retry safely.
+* **Business Logic Failures (Insufficient Funds, Inactive Wallet):**
+  $\rightarrow$ **DO NOT ROLL BACK!** Rolling back deletes the transfer record and idempotency key from the database, causing audit history loss and non-deterministic retry behavior.
+  $\rightarrow$ Instead, the transaction **commits** with:
+  1. Transfer `status = FAILED`, `failure_reason = 'INSUFFICIENT_FUNDS'`.
+  2. Idempotency record saved with `response_status = 409` (or 422) and cached error body.
+  3. Zero ledger entries created; wallet balances unchanged.
+  4. Retrying the request returns the identical cached failure response deterministically.
+
+### 6.2 Workflow
 
 ```mermaid
 sequenceDiagram
@@ -245,33 +265,50 @@ sequenceDiagram
             Handler-->>Client: HTTP 200 (Replay of original response)
         else Payload Mismatch
             Service-->>Handler: ErrIdempotencyConflict
-            Handler-->>Client: HTTP 409 / 422 Conflict
+            Handler-->>Client: HTTP 409 Conflict
         end
     else Key does not exist
         Service->>Database: Begin Transaction
         Service->>Database: Lock Wallets in Sorted Order (FOR UPDATE)
-        Service->>Database: Verify Funds (balance >= amount)
-        Service->>Database: Update fromWallet (balance - amount)
-        Service->>Database: Update toWallet (balance + amount)
-        Service->>Database: Insert Transfer Record (status = PROCESSED)
-        Service->>Database: Insert 2 Ledger Entries (DEBIT & CREDIT)
-        Service->>Database: Insert Idempotency Record (status, response_body)
-        Service->>Database: Commit Transaction
-        Service-->>Handler: Return Transfer Result
-        Handler-->>Client: HTTP 201 Created
+        alt Sufficient Funds
+            Service->>Database: Deduct fromWallet (balance - amount)
+            Service->>Database: Add toWallet (balance + amount)
+            Service->>Database: Insert Transfer Record (status = PROCESSED)
+            Service->>Database: Insert 2 Ledger Entries (DEBIT & CREDIT)
+            Service->>Database: Insert Idempotency Record (status = COMPLETED)
+            Service->>Database: Commit Transaction
+            Service-->>Handler: Return Transfer Result
+            Handler-->>Client: HTTP 201 Created
+        else Insufficient Funds
+            Service->>Database: Insert Transfer Record (status = FAILED, reason = INSUFFICIENT_FUNDS)
+            Service->>Database: Insert Idempotency Record (status = COMPLETED, code = 409)
+            Service->>Database: Commit Transaction (Persist Audit)
+            Service-->>Handler: ErrInsufficientFunds
+            Handler-->>Client: HTTP 409 Insufficient Funds
+        end
     end
 ```
 
-### 6.2 Race on Simultaneous Duplicate Requests
+### 6.3 Race on Simultaneous Duplicate Requests
 If two identical requests with the same `idempotencyKey` arrive at the exact same millisecond:
-* Both may see that no record exists initially.
-* Both will attempt to insert into `idempotency_records`.
 * The primary key constraint on `idempotency_records.key` will reject the second insertion with a unique constraint violation.
 * The loser transaction rolls back cleanly, catches the duplicate key error, and retrieves the winner's committed response.
 
 ---
 
-## 7. Layered Architecture (Go 1.24)
+## 7. Addressing Common Candidate Pitfalls
+
+| Candidate Failure Pattern | Why Other Candidates Failed | How Our Design Addresses It (SDE-3 Level) |
+|---|---|---|
+| **Bidirectional Deadlocks** | Locked `fromWallet` then `toWallet`. Simultaneous $A \to B$ and $B \to A$ caused deadlocks. | **Deterministic Ordering:** Lexicographically sort wallet IDs (`min(A, B)` then `max(A, B)`) before acquiring `FOR UPDATE` locks. |
+| **Vanishing Failure State** | On insufficient funds, set `FAILED` then returned error triggering rollback $\to$ status was wiped. | **Committed Failure Audit:** Terminal failure states and idempotency records are committed; no ledger entries are created. |
+| **Idempotency Race Conditions** | Checked `SELECT` before `INSERT`; concurrent duplicates both saw empty rows and charged twice. | **Durable DB Unique Key:** Enforced by database primary key on `idempotency_records.key` with atomic payload hashing. |
+| **Weak Invariant Enforcement** | Relied purely on Go application logic without database constraints. | **Defense in Depth:** DB `CHECK (balance >= 0)`, `CHECK (amount > 0)`, and foreign keys guarantee data integrity even during code defects. |
+| **Missing Request Validation** | Allowed self-transfers ($A \to A$), non-positive amounts, or untrimmed strings. | **Strict Pre-Lock Validation:** Reject malformed requests with `400 Bad Request` prior to initiating any database locks. |
+
+---
+
+## 8. Layered Architecture (Go 1.24)
 
 ```text
 wallet-transfer-assignment/
@@ -303,7 +340,7 @@ wallet-transfer-assignment/
 
 ---
 
-## 8. Testing Discipline
+## 9. Testing Discipline
 
 Testing follows the **Red-Green-Refactor** behavioral discipline:
 1. **Unit Testing:**
@@ -313,14 +350,14 @@ Testing follows the **Red-Green-Refactor** behavioral discipline:
    - Full transactional workflow against an isolated database (in-memory SQLite / test Postgres).
    - Idempotency verification: 10 repeated requests with the same key produce exactly 1 debit and return identical responses.
    - Idempotency conflict verification: Reusing key with different amount returns HTTP 409.
-   - Insufficient funds check: Transfer fails gracefully with no balance mutation.
-3. **Concurrency Stress Testing:**
+   - Insufficient funds check: Transfer records `FAILED` status and returns cached error on retry.
+3. **High-Concurrency Stress Testing:**
    - Spin up $N = 50$ concurrent goroutines executing simultaneous transfers on shared wallets.
    - Validate zero deadlocks, zero negative balances, and verify that the final sum of wallet balances equals initial capital.
 
 ---
 
-## 9. AI Tooling Disclosure
+## 10. AI Tooling Disclosure
 
 * **Tool:** Google Antigravity (Advanced Agentic Pair Programming).
 * **Usage:** Architectural refinement, database schema constraint design, deadlock edge-case analysis, testing matrix generation, and documentation drafting.
