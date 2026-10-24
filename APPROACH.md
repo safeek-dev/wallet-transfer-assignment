@@ -64,12 +64,12 @@ Before opening database transactions or acquiring locks, the request is validate
 * `404 Not Found`: Source or destination wallet does not exist.
 * `409 Conflict`: 
   1. Idempotency key reused with a conflicting payload (different amount or destination).
-  2. Insufficient funds (or `422 Unprocessable Entity` depending on API preference).
+  2. Insufficient funds (committed failure with audit persistence).
 * `500 Internal Server Error`: Unhandled database error or unexpected infrastructure failure.
 
 ---
 
-## 3. Database Schema Design (PostgreSQL / SQLite Compatible)
+## 3. Database Schema Design
 
 ### 3.1 Entity Relationship Overview
 
@@ -186,28 +186,34 @@ If two requests debit the same wallet ($W_1$) concurrently:
 * Request 2: Debits \$50 from $W_1$ (balance = \$100).
 * Without locking, both check `$100 >= amount` simultaneously and both succeed, driving the balance to `-$30` (double-spending).
 
-### 4.2 Solution: Deterministic Row-Level Locking
-We use pessimistic row-level locks within an explicit ACID transaction:
+### 4.2 Database Concurrency Strategy: PostgreSQL vs. SQLite
+
+#### Primary Production Target: PostgreSQL (Fine-Grained Row-Level Locking)
+In PostgreSQL, we use pessimistic row-level locks within an explicit ACID transaction:
 ```sql
 SELECT id, balance FROM wallets WHERE id = $1 FOR UPDATE;
 ```
+* **Deadlock Elimination via Deterministic Ordering:** If Tx 1 transfers $W_A \to W_B$ while Tx 2 transfers $W_B \to W_A$, arbitrary locking order causes a circular deadlock. We eliminate this by **always acquiring row locks in lexicographically sorted order** of wallet IDs:
+  ```go
+  firstWalletID, secondWalletID := fromWalletID, toWalletID
+  if firstWalletID > secondWalletID {
+      firstWalletID, secondWalletID = toWalletID, fromWalletID
+  }
 
-#### Deadlock Elimination via Deterministic Ordering
-A classic deadlock occurs if:
-* Tx 1 transfers $W_A \to W_B$ (locks $W_A$, then waits for $W_B$).
-* Tx 2 transfers $W_B \to W_A$ (locks $W_B$, then waits for $W_A$).
+  // 1. SELECT ... WHERE id = firstWalletID FOR UPDATE
+  // 2. SELECT ... WHERE id = secondWalletID FOR UPDATE
+  ```
+  Because all concurrent transactions acquire row locks in the exact same global order, cyclic wait graphs are mathematically prevented.
 
-To prevent this deadlock, we **always acquire row locks in lexicographically sorted order** of wallet IDs:
-```go
-firstWalletID, secondWalletID := fromWalletID, toWalletID
-if firstWalletID > secondWalletID {
-    firstWalletID, secondWalletID = toWalletID, fromWalletID
-}
-
-// 1. Lock firstWalletID
-// 2. Lock secondWalletID
-```
-Because all concurrent transactions acquire locks in the exact same global order, cyclic wait conditions are mathematically impossible.
+#### Secondary / Local Target: SQLite (Database-Level Transaction Serialization)
+> **Note on SQLite Concurrency:** SQLite does not support row-level locks (`SELECT ... FOR UPDATE` is invalid syntax).
+* For SQLite environments (e.g. lightweight local embedded runs), concurrency is managed via **database-level transaction serialization**:
+  - Open transactions with `BEGIN IMMEDIATE` (or `BEGIN EXCLUSIVE`) to acquire a write reservation upfront, avoiding mid-transaction upgrade deadlocks.
+  - Configure `PRAGMA busy_timeout = 5000;` and WAL mode (`PRAGMA journal_mode = WAL;`).
+  - Implement application-level exponential backoff retries on `SQLITE_BUSY` errors.
+* **Test Validation Matrix:**
+  - True non-blocking, multi-wallet row concurrency is tested against **PostgreSQL** (where $W_A \to W_B$ and $W_C \to W_D$ run in parallel without blocking each other).
+  - SQLite validates functional correctness and serialized execution safety.
 
 ### 4.3 Database Check Constraint
 In addition to application row locking, the `balance >= 0` database constraint guarantees defense-in-depth: even if application locking fails due to a bug, the database engine will abort any transaction that causes a negative balance.
@@ -234,7 +240,7 @@ For every transfer of amount $X$ from $W_{from}$ to $W_{to}$:
 ## 6. Idempotency & Failure Persistence Strategy
 
 ### 6.1 Differentiating System Errors vs Business Failures (Crucial SDE-3 Distinction)
-* **System Errors (DB connection timeout, deadlock kill):**
+* **System Errors (DB connection timeout, infrastructure crash):**
   $\rightarrow$ The database transaction **rolls back** cleanly. The client receives `500 Internal Server Error` (or `503 Service Unavailable`) and can retry safely.
 * **Business Logic Failures (Insufficient Funds, Inactive Wallet):**
   $\rightarrow$ **DO NOT ROLL BACK!** Rolling back deletes the transfer record and idempotency key from the database, causing audit history loss and non-deterministic retry behavior.
@@ -261,21 +267,21 @@ sequenceDiagram
         Database-->>Service: Return cached record
         Service->>Service: Compare SHA256(request_payload) with request_hash
         alt Payload Matches
-            Service-->>Handler: Return cached response_body & status
-            Handler-->>Client: HTTP 200 (Replay of original response)
+            Service-->>Handler: Return cached response_body & cached response_status
+            Handler-->>Client: Replay cached response (HTTP 200/201 if success, HTTP 409 if failed)
         else Payload Mismatch
             Service-->>Handler: ErrIdempotencyConflict
-            Handler-->>Client: HTTP 409 Conflict
+            Handler-->>Client: HTTP 409 Conflict (Idempotency Key reused with different payload)
         end
     else Key does not exist
         Service->>Database: Begin Transaction
-        Service->>Database: Lock Wallets in Sorted Order (FOR UPDATE)
+        Service->>Database: Lock Wallets in Sorted Order (FOR UPDATE / BEGIN IMMEDIATE)
         alt Sufficient Funds
             Service->>Database: Deduct fromWallet (balance - amount)
             Service->>Database: Add toWallet (balance + amount)
             Service->>Database: Insert Transfer Record (status = PROCESSED)
             Service->>Database: Insert 2 Ledger Entries (DEBIT & CREDIT)
-            Service->>Database: Insert Idempotency Record (status = COMPLETED)
+            Service->>Database: Insert Idempotency Record (status = COMPLETED, code = 201)
             Service->>Database: Commit Transaction
             Service-->>Handler: Return Transfer Result
             Handler-->>Client: HTTP 201 Created
@@ -289,20 +295,30 @@ sequenceDiagram
     end
 ```
 
-### 6.3 Race on Simultaneous Duplicate Requests
-If two identical requests with the same `idempotencyKey` arrive at the exact same millisecond:
-* The primary key constraint on `idempotency_records.key` will reject the second insertion with a unique constraint violation.
-* The loser transaction rolls back cleanly, catches the duplicate key error, and retrieves the winner's committed response.
+### 6.3 Handling Races on Duplicate Requests with Identical or Conflicting Payloads
+
+When concurrent duplicate requests with the same `idempotencyKey` arrive simultaneously:
+1. **Constraint Collision Detection:**
+   - Both requests may miss the initial lookup because neither has committed yet.
+   - The transaction attempts insertion. Depending on insertion order, the loser request will trigger a database UNIQUE constraint violation on **either** `transfers.idempotency_key` or `idempotency_records.key`.
+   - The application transaction manager explicitly catches duplicate key / unique constraint errors on both entities.
+2. **Post-Rollback Re-Validation & Conflict Detection:**
+   - The loser transaction immediately rolls back and polls/retrieves the winner's committed `idempotency_records` entry.
+   - **Crucial Conflict Check:** The loser compares its incoming payload hash against the winner's committed `request_hash`:
+     - **Matching Payloads (Legitimate Retry Race):** Return the winner's cached response (status code and body).
+     - **Conflicting Payloads (Key Collision Race):** If two racing requests used the same `idempotencyKey` but had *different* parameters (e.g., Req A sent amount \$100, Req B sent amount \$200), the loser MUST NOT replay Req A's result. Instead, it rejects Req B with **`HTTP 409 Conflict`** indicating the key is already claimed with a different request payload.
 
 ---
 
-## 7. Addressing Common Candidate Pitfalls
+## 7. Reviewer Rubric & Common Failure Patterns Addressed
 
 | Candidate Failure Pattern | Why Other Candidates Failed | How Our Design Addresses It (SDE-3 Level) |
 |---|---|---|
 | **Bidirectional Deadlocks** | Locked `fromWallet` then `toWallet`. Simultaneous $A \to B$ and $B \to A$ caused deadlocks. | **Deterministic Ordering:** Lexicographically sort wallet IDs (`min(A, B)` then `max(A, B)`) before acquiring `FOR UPDATE` locks. |
 | **Vanishing Failure State** | On insufficient funds, set `FAILED` then returned error triggering rollback $\to$ status was wiped. | **Committed Failure Audit:** Terminal failure states and idempotency records are committed; no ledger entries are created. |
-| **Idempotency Race Conditions** | Checked `SELECT` before `INSERT`; concurrent duplicates both saw empty rows and charged twice. | **Durable DB Unique Key:** Enforced by database primary key on `idempotency_records.key` with atomic payload hashing. |
+| **Inaccurate Failure Replay** | Replaying cached business errors returned `HTTP 200` instead of the original error code. | **Preserved Response Status:** Idempotency cache stores `response_status` (e.g. 409); replays preserve original status and body. |
+| **Idempotency Race with Different Payloads** | Racing duplicates with same key but different payloads replayed the winner's transfer. | **Post-Race Hash Re-Verification:** On unique constraint error, compare payload hash with winner; return `409 Conflict` if mismatch. |
+| **SQLite `SELECT FOR UPDATE` Crash** | Attempted to use Postgres row locks in SQLite, causing syntax errors in local tests. | **Differentiated Locking Strategy:** Postgres uses row-level locks; SQLite uses `BEGIN IMMEDIATE` serialized transactions with backoff. |
 | **Weak Invariant Enforcement** | Relied purely on Go application logic without database constraints. | **Defense in Depth:** DB `CHECK (balance >= 0)`, `CHECK (amount > 0)`, and foreign keys guarantee data integrity even during code defects. |
 | **Missing Request Validation** | Allowed self-transfers ($A \to A$), non-positive amounts, or untrimmed strings. | **Strict Pre-Lock Validation:** Reject malformed requests with `400 Bad Request` prior to initiating any database locks. |
 
@@ -329,8 +345,8 @@ wallet-transfer-assignment/
 │   │   └── transfer_service_test.go
 │   └── repository/               # Data access layer
 │       ├── repository.go         # Interfaces for Wallet, Transfer, Ledger, Idempotency
-│       ├── postgres/             # PostgreSQL / SQLite implementations with row locks
-│       └── memory/               # In-memory mock repository for lightning unit tests
+│       ├── postgres/             # PostgreSQL implementation with row locks (SELECT ... FOR UPDATE)
+│       └── sqlite/               # SQLite implementation with BEGIN IMMEDIATE serialization
 ├── db/
 │   └── migrations/               # Up/down SQL schema scripts
 ├── go.mod
@@ -347,12 +363,12 @@ Testing follows the **Red-Green-Refactor** behavioral discipline:
    - Model validations (e.g., negative transfer rejection, self-transfer rejection).
    - Invariant calculations (ledger sum matches delta).
 2. **Integration Testing:**
-   - Full transactional workflow against an isolated database (in-memory SQLite / test Postgres).
+   - Full transactional workflow against an isolated database.
    - Idempotency verification: 10 repeated requests with the same key produce exactly 1 debit and return identical responses.
    - Idempotency conflict verification: Reusing key with different amount returns HTTP 409.
    - Insufficient funds check: Transfer records `FAILED` status and returns cached error on retry.
 3. **High-Concurrency Stress Testing:**
-   - Spin up $N = 50$ concurrent goroutines executing simultaneous transfers on shared wallets.
+   - Spin up $N = 50$ concurrent goroutines executing simultaneous transfers on shared wallets against PostgreSQL.
    - Validate zero deadlocks, zero negative balances, and verify that the final sum of wallet balances equals initial capital.
 
 ---
